@@ -3,7 +3,6 @@
 ### incback ###
 # Create incremental backups with tar
 #
-# Current scheme: First backup in week is full, other weekdays get an incremental backup
 #
 #    Copyright (C) 2018 Falk Scharbau <falk@scharbau.de>
 #
@@ -21,36 +20,45 @@
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 ###
+read -r -d '' usageText <<'EOF'
+Usage:
 
-# We use gzip compression. Change to ".tar.bz2" and "j" for bzip2 compression
-BACKUP_EXTENSION=".tar.gz"
-BACKUP_TAR_ARG="z"
+  incback-core -v [-c <compression>] [-f <config_file>] [-d <destination>] [-p <parent_backup>] [-s <source>..] [ACTION [ACTION_ARG]]
 
-FULL_BACKUP_NAME="full$BACKUP_EXTENSION"
-INC_BACKUP_NAME="inc$BACKUP_EXTENSION"
+  Actions:
+    backup full|incremental
+	  - full        : Create full backup
+ 	  - incremental	: Create incremental backup, must have -p option to set parent backup.
+
+    restore
+      Restore the backup given by the -p option.
+
+    list [full|incremental]
+      List all or only full/incremental backups at the current backup destination.
+
+    show
+      Show details about the backup given by the -p option.
+
+  Options:
+	-b					: Batch mode. Auto-approve all confirmation prompts.
+    -c <compression>    : Set compression alogrithm, "gzip"(default) and "bzip2" supported
+    -d <destination>    : Set destination directory for backup
+    -f <config_file>    : Set a configuration file to use. Command line parameters have precedence.
+    -p <parent_backup>  : Used for incremental backups and restoration. Relative path under destination directory pointing to a parent backup
+                          to restore or to base the incremental backup on. For incremental backups the location must contain a snapshot file
+    -s <source>         : Add source file or directory for backup, allowed multiple times
+    -v                  : Enable verbose output
+EOF
+
+BACKUP_FILENAME="archive"
+SNAPSHOT_FILENAME="level%d.snapshot"
 
 # Temporary directory
 #TMP_DIR=`mktemp -d`
 #trap "rm -rf $TMP_DIR" EXIT
 
 function usage {
-	echo "Usage:"
-	echo "1. incback backup [<conf-file>]"
-	echo "	Create backup according to given configuration file"
-	echo "	- conf-file: File containing backup configuration, if omitted uses incback.conf in current directory"
-	echo
-	echo "	Configuration parameters:"
-	echo "	- src: Source directory that is to be backed up"
-	echo "	- dest: Destination directory for backup archives and snapshot files"
-	echo
-	echo "2. incback list"
-	echo "	List all available backups"
-	echo
-	echo "3. incback restore"
-	echo "	Choose a backup to restore"
-	echo
-	echo "4. incback remove"
-	echo "	Choose a backup to remove"
+	echo "$usageText" 	
 }
 
 ### Helper functions for colored output and graceful exit
@@ -70,32 +78,44 @@ function fail {
 	exit $code
 }
 
+function print_msg {
+	echo -en "$1"
+	[ "$2" = true ] && echo
+}
+
 function print_err {
-	echo -en "\e[31m\e[1m$1\e[0m"
+	print_msg "\e[31m\e[1m$1\e[0m" "$2"
 }
 
 function print_ok {
-	echo -en "\e[32m\e[1m$1\e[0m"
+	print_msg "\e[32m\e[1m$1\e[0m" "$2"
 }
 
 function print_warn {
-	echo -en "\e[33m\e[1m$1\e[0m"
+	print_msg "\e[33m\e[1m$1\e[0m" "$2"
 }
 
 function print_info {
-	echo -en "\e[37m\e[1m$1\e[0m"
+	print_msg "\e[36m\e[1m$1\e[0m" "$2"
 }
 
 ## Load configuration
 function loadConfiguration {
 	
 	config="$CONFIG_FILE"
-#	if [ $# -gt 0 ]
-#	then
-#		config="$2"	
-#	fi
 
-	echo "Configuration file	: $config"
+	if [ "$VERBOSE" = true ]; then
+		echo -n "Configuration file	: "
+		if [ -z "$config" ]; then
+			echo "[none]"
+		else
+			echo "$config"
+		fi
+	fi
+	
+	if [ -z "$config" ]; then
+		return
+	fi
 
 	if [ ! -f "$config" ]
 	then
@@ -104,123 +124,182 @@ function loadConfiguration {
 
 	source "$config"
 
-	# Check configuration
-	if [ -z "$src" ]
-	then
-		fail "Backup source not set!" 2
-	fi
-
-	if [ -z "$dest" ]
-	then
-		fail "Backup destination not set!" 3
-	fi
 	
 }
 
 
 # Check backup preconditions
 
-function checkBackupPreconditions {
-
-	VALID=true
+function checkBackupSource {
 
 	# Backup source
 
-	echo -n "Backup source	 	: $src "
-
-	if [ ! -d "$src" ]; then
-		print_err "NOT FOUND"	
-		VALID=false
-	else
-		print_ok "Ok"
+	if [ -z "$BACKUP_SOURCE" ]; then
+		fail "No backup source defined!" 100	
 	fi
-	echo
-
-	# Backup destination
-
-	destString="$ip"
-	remote=true
-
-	if [ -z "$destString" ]; then
-		destString="$dest"
-		remote=false
-	else
-		destString="$destString:$dest"
-		fail "NOT IMPLEMENTED YET" 200
-	fi
-
-
-	#echo -n "This backup will be stored "
-	#if [ "$remote" = true ]; then
-	#	print_info "remotely"
-	#else
-	#	print_info "locally"
-	#fi
-	#echo "."
-
-
-	echo -n "Backup destination	: $destString "
-
-	if [ "$remote" = true ]; then
-		fail "not_implemented" 200
-	else
 	
-		if [ ! -d "$dest" ]; then
-			print_err "NOT FOUND"	
-			VALID=false
-		else
-			print_ok "Ok"
+	[ "$VERBOSE" = true ] && echo "Backup source	 	: $BACKUP_SOURCE "
+
+	
+	if [ ! -d "$BACKUP_SOURCE" ]; then
+		fail "Backup source not found!" 100	
+	fi
+}
+
+function checkBackupDestination {
+	
+	if [ -z "$BACKUP_DESTINATION" ]; then
+		fail "No backup destination defined!" 100	
+	fi
+	
+	[ "$VERBOSE" = true ] && echo "Backup destination	: $BACKUP_DESTINATION "
+
+	if [ ! -d "$BACKUP_DESTINATION" ]; then
+		[ "$VERBOSE" = true ] && print_info "Backup destination not found. Creating ..."
+		mkdir -p "$BACKUP_DESTINATION"
+		if [ ! -d "$BACKUP_DESTINATION" ]; then
+			fail "Could not create backup destination!" 102
 		fi
 	fi
-	echo
+}
 
-	if [ "$VALID" = false ]; then
-		fail "At least one precondition failed!" 100
+function checkBackupParent {
+
+	if [ -z "$BACKUP_PARENT" ]; then
+		fail "No backup parent defined!" 100	
 	fi
 
-	echo 
+	[ "$VERBOSE" = true ] && echo "Backup parent		: $BACKUP_PARENT "
+
+	if [ ! -d "$BACKUP_PARENT" ]; then
+
+		parentDirs=($(find "$BACKUP_DESTINATION" -type d -name "$BACKUP_PARENT"))
+		if [ "${#parentDirs[@]}" -gt 1 ]; then
+			print_err "Backup parent is ambivalent!" true
+			for dir in "${parentDirs[@]}"; do
+				print_warn "$dir" true
+			done
+			fail "Cannot continue." 180
+		elif [ "${#parentDirs[@]}" -eq 0 ]; then
+			fail "Backup parent not found!" 112
+		fi
+		
+		BACKUP_PARENT="${parentDirs[0]}"
+		
+	fi
 }
 
 # Perform daily incremental backup
-
+# $1: source directory
+# $2: destination directory
+# $3: archive file
+# $4: parent directory
 function incrementalBackup {
-	print_info "Creating incremental backup for day $YEAR-$WEEK-$DAY ..."
+
+	source="$1"
+	parent="$4"
+	archive="$3"
+	directory="$parent/$2"
+		
+	local files=(`ls $parent/*.snapshot 2>/dev/null`);
+	local parentSnapshot="${files[0]}"
+	
+	if [ -z "$parentSnapshot" ]; then
+		fail "No snapshot file found in parent backup!" 160
+	fi
+	
+	[ "$VERBOSE" = true ] && echo "Based on		: $parentSnapshot"
+	
+	local parentLevel=${parentSnapshot##*level}
+	parentLevel=${parentLevel%.*}
+	
+	case $parentLevel in
+    	''|*[!0-9]*) fail "Could not determine base level! ($parentSnapshot)" 161 ;;
+    	*)  ;;
+	esac
+			
+	local level=$((parentLevel+1))
+	
+	[ "$VERBOSE" = true ] && echo "Level increment		: $parentLevel > $level"
+	
+	local snapshotFile
+	printf -v snapshotFile "$SNAPSHOT_FILENAME" "$level"
+							
+	[ "$VERBOSE" = true ] && echo "Snapshot file		: $snapshotFile"
+
+	[ "$VERBOSE" = true ] && echo
+		
+	print_info "Creating incremental backup ..."
 	echo
 	
-	mkdir -p "$DAY_DIR"
-	cp -a "$WEEK_DIR/level0.snapshot" "$DAY_DIR/level1.snapshot"
-	performBackup "$DAY_DIR/level1.snapshot" "$dayBackupFile"
+	mkdir -p "$directory"
+	cp -a "$parentSnapshot" "$directory/$snapshotFile"
+	
+	performBackup "$source" "$directory" "$archive" "$snapshotFile"
 	
 	return $?
 }
 
 
-# Perform weekly full backup
+# Perform full backup
+# $1: source directory
+# $2: destination directory
+# $3: archive file
 function fullBackup {
-	print_info "Creating full backup for week $YEAR-$WEEK ..."
-	echo
 	
-	performBackup "$WEEK_DIR/level0.snapshot" "$weekBackupFile"
+	source="$1"
+	directory="$BACKUP_DESTINATION/$2"
+	archive="$3"
+
+	local snapshotFile
+	printf -v snapshotFile "$SNAPSHOT_FILENAME" 0
 	
+	[ "$VERBOSE" = true ] && echo "Snapshot file		: $snapshotFile"
+
+	[ "$VERBOSE" = true ] && echo
+						
+	print_info "Creating full backup  ... "
+	
+	[ "$VERBOSE" = true ] && echo
+												
+	performBackup "$source" "$directory" "$archive" "$snapshotFile"
+			
 	return $?
 }
 
+### performBackup
+# Actually call tar with a lot of fancy args.
+# $1: source directory
+# $2: destination directory
+# $3: archive file name
+# $4: snapshot file name
 function performBackup {
 
-	snapshotFile="$1"
-	backupFile="$2"
+	source="$1"
+	destination="$2"
+	backupFile="$3"
+	snapshotFile="$4"
+		
 	
-	backupDir=`dirname "$backupFile"`
-	
-	mkdir -p "$backupDir"
-
+	mkdir -p "$destination"
 	
 	backupStart=$SECONDS	
 	
-	tar --listed-incremental="$snapshotFile" -cvpzf "$backupFile" -C "$src" .
+	local tarOps="-cp"
+	[ "$VERBOSE" = true ] && tarOps="${tarOps}v"
+	
+	if [ "$BACKUP_COMPRESSION" == "gzip" ]; then
+		tarOps="${tarOps}z"
+	elif [ "$BACKUP_COMPRESSION" == "bzip2" ]; then
+		tarOps="${tarOps}j"
+	else
+		fail "Unknown compression! ($BACKUP_COMPRESSION)" 150
+	fi	
+	
+	tarOps="${tarOps}f"
+	tar --listed-incremental="$destination/$snapshotFile" $tarOps "$destination/$backupFile" -C "$source" .
 
 	res=$?
-
 
 	if [ ! $res -eq 0 ];
 	then
@@ -232,7 +311,9 @@ function performBackup {
 		backupMin=$(($backupDuration / 60))
 		backupSec=$(($backupDuration % 60))
 
-		print_ok "OK. Took ${backupMin}min ${backupSec}sec.\n"
+		print_ok "OK." true
+		[ "$VERBOSE" = true ] && echo "Took ${backupMin}min ${backupSec}sec."
+		
 	fi
 
 	return $res
@@ -241,71 +322,165 @@ function performBackup {
 ### backup
 # Creates full and incremental backups
 # Loads configuration, checks preconditions, determines backup level and performs that backup if needed
+# $1: "full" or "incremental"
 
 function backup {
 
-	loadConfiguration
-	
-	checkBackupPreconditions
+	[ "$VERBOSE" = true ] && echo && echo "Backup requested." && echo
 
-	# Determine backup level
-
-	YEAR=`date +%Y`
-	WEEK=`date +%V`
-	DAY=`date +%d`
-
-	echo "Year	: $YEAR"
-	echo "Week	: $WEEK"
-	echo "Day	: $DAY"
-	echo
-
-	# WEEK
-	WEEK_DIR="$dest/$YEAR/$WEEK"
-
-	weekBackupFile="$WEEK_DIR/$FULL_BACKUP_NAME"
-
-	echo -n "Weekly full backup		: "
+	# Type: full or incremental
+	local backupType="$1"
 	
-	if [ ! -f "$weekBackupFile" ]; then
+	[ -z "$backupType" ] && fail "No backup type!" 110
 	
-		print_warn "not found"
-		echo
-		echo
+	case "$backupType" in
+		full)
+			backupType="full";;
+		incremental)
+			backupType="incremental";;
+		*)
+			fail "Unknown backup type! ($1)" 111;;
+	esac
+
+	# Check directories
+	checkBackupSource
+	checkBackupDestination
 	
-		fullBackup
-	
-		exit $?
-	
+	if [ "$backupType" == "incremental" ]; then
+		checkBackupParent
 	fi
 	
-	print_ok "present"
-	echo
-
-	# DAY
-	DAY_DIR="$WEEK_DIR/$DAY"
-
-	echo -n "Daily incremental backup	: "
-	dayBackupFile="$DAY_DIR/$INC_BACKUP_NAME"
-
-	if [ ! -f "$dayBackupFile" ]; then
+	# Timestamp and subdirectory for backup
+	local timestamp=`date -R`
+	local directory=`date -d"$timestamp" +%Y%m%d-%H%M%S`
 	
-		print_warn "not found"
-		echo
-		echo
-	
-		incrementalBackup
-	
-		exit $?
-	
+	if [ "$backupType" == "full" ]; then
+		directory="$directory-full"
+	else
+		directory="$directory-incremental"
 	fi
 	
-	print_ok "present"
-	echo
-	echo "Nothing to do. Exiting."
+	[ "$VERBOSE" = true ] && echo "Timestamp		: $timestamp"
+	[ "$VERBOSE" = true ] && echo "Compression		: $BACKUP_COMPRESSION"
+	
+	# Archive file name
+	local ext
+	if [ "$BACKUP_COMPRESSION" == "gzip" ]; then
+		ext="tar.gz"
+	elif [ "$BACKUP_COMPRESSION" == "bzip2" ]; then
+		ext="tar.bz2"
+	else
+		fail "Unknown compression! ($BACKUP_COMPRESSION)" 150
+	fi	
+	
+	local archiveFile="$BACKUP_FILENAME.$ext"
+		
+	if [ "$VERBOSE" = true ]; then
+		echo "Backup type 		: $backupType"
+		echo "Directory   		: `basename "$directory"`"
+		echo "Archive file 		: $archiveFile"
+	fi
+	
 
-	echo
+	if [ "$backupType" == "full" ]; then
+		fullBackup "$BACKUP_SOURCE" "$directory" "$archiveFile"
+	else
+		incrementalBackup "$BACKUP_SOURCE" "$directory" "$archiveFile" "$BACKUP_PARENT"
+	fi
+	
 }
 
+### readDirectory
+# $1: directory to read
+# $2: depth
+function readDirectory {
+	
+	local directory="$1"
+	local depth="$2"
+	
+	# Read files at destination and filter full backup directories
+	local files=($directory/*)
+	local fullDirs=()
+	for file in "${files[@]}"; do
+		[[ -d "$file" ]] && fullDirs+=("$file")
+	done
+
+	# Handle full backup directories
+	for currentDir in "${fullDirs[@]}"; do
+		
+		local backupName=`basename "$currentDir"`		
+			
+		readBackup "$currentDir"
+
+		if [ "${backupInfo[0]}" = false ]; then
+			echo -n "[$backupName] "
+			print_err "${backupInfo[1]}" true
+
+		else
+		
+			local archive="${backupInfo[1]}"
+			local snapshot="${backupInfo[2]}"
+	
+			local archiveDate=`date -r "$currentDir" "+%d.%m.%Y-%H:%M:%S"`
+						
+			local archiveSize=`stat -c '%s' "$archive"`
+			archiveSize=`numfmt --to=iec-i --suffix=B --format="%3f" $archiveSize`
+			
+			local type="Full"
+			[ "$depth" -gt 0 ] && type="Level $depth"
+			
+			local i=0;
+			while [ "$i" -lt "$depth" ]; do echo -n "  "; ((i++)); done
+			
+			echo "$archiveDate $type backup ($archiveSize) [$backupName]"
+		fi
+		
+		readDirectory "$currentDir" "$((depth+1))"
+			
+	done
+	
+}
+
+### readBackup
+# $1: directory to read
+#
+# Sets global 'backupInfo'
+# If success, contains "true",archive file,snapshot file and incremental level
+# If failure, contains "false" and error message
+function readBackup {
+
+	local backupName=`basename $1`
+	local files=($(find "$1" -maxdepth 1 -type f -name "$BACKUP_FILENAME.tar.gz" -o -type f -name "$BACKUP_FILENAME.tar.gz2"))
+	local archive="${files[0]}"
+	
+	files=($1/*.snapshot);
+	
+	local snapshot="${files[0]}"
+	
+	local level=${snapshot##*level}
+	level=${level%.*}
+	
+	local success=true
+	local error=""
+	
+	# Archive file
+	if [ ! -f "$archive" ]; then
+		success=false
+		error="No archive file found!"
+	elif [ ! -f "$snapshot" ]; then
+		success=false
+		error="No snapshot file found!"
+	elif [ -z "$level" ]; then
+	 	success=false
+	 	error="Could not determine backup level!"
+ 	fi
+	
+	if [ "$success" = true ]; then
+		backupInfo=(true "$archive" "$snapshot" "$level")
+	else
+		backupInfo=(false "$error")
+	fi
+}
 
 ### list
 # Lists all available backups
@@ -314,99 +489,13 @@ function list {
 	local output="$1"
 	[ -z "$output" ] && output=true
 
-	loadConfiguration
-
-	# Check if destination is reachable
-	echo -n "Backup destination	: $dest "
-
-	if [ -d "$dest" ]; then
-		print_ok "Ok"
-	else
-		fail "NOT FOUND" 11
-	fi
-	echo
+	checkBackupDestination
 	
-	[ "$output" = true ] && echo	
+	[ "$output" = true ] && [ "$VERBOSE" = true ] && echo
 	
-	#Collect numbered backups
-	backups=()
-	backupIndex=0
-
-	# Deal with empty directories. Reset at the end
-	shopt -s nullglob
+	local depth=0	
 	
-	# Read files at destination and filter year-directories
-	local files=($dest/*)
-	local yearDirs=()
-	for file in "${files[@]}"; do
-		[[ -d "$file" ]] && yearDirs+=("$file")
-	done
-
-	
-	# Handle year-directories
-	for yearDir in "${yearDirs[@]}"; do
-		
-		local year=`basename "$yearDir"`		
-			
-		# Determine week-directories
-		files=($yearDir/*)
-		local weekDirs=()
-		for file in "${files[@]}"; do
-			[[ -d "$file" ]] && weekDirs+=("$file")
-		done
-
-		# Handle week-directories	
-		for weekDir in "${weekDirs[@]}"; do
-
-			local week=`basename "$weekDir"`		
-			local fullArchive="$weekDir/$FULL_BACKUP_NAME"
-			local fullSnapshot="$weekDir/level0.snapshot"
-
-			# Archive and snapshot file must be present else skip.
-			[[ ! -f "$fullArchive" ]] || [[ ! -f "$fullSnapshot" ]] && continue
-
-			local fullArchiveDate=`date -r "$fullArchive"`
-			
-			local fullArchiveSize=`stat -c '%s' "$fullArchive"`
-			fullArchiveSize=`numfmt --to=iec-i --suffix=B --format="%3f" $fullArchiveSize`
-			
-			backups+=("$fullArchive");
-			((backupIndex++))
-			
-			[ "$output" = true ] &&	echo "$backupIndex. Full backup (week $week) on $fullArchiveDate ($fullArchiveSize)"
-			
-			# Determine day-directories
-			files=($weekDir/*)
-			local dayDirs=()
-			for file in "${files[@]}"; do
-				[[ -d "$file" ]] && dayDirs+=("$file")
-			done
-
-
-			# Handle day-directories
-			for dayDir in "${dayDirs[@]}"; do
-
-				local day=`basename "$dayDir"`		
-				local incArchive="$dayDir/$INC_BACKUP_NAME"
-				local incSnapshot="$dayDir/level1.snapshot"
-			
-				# Archive and snapshot file must be present else skip.
-				[[ ! -f "$incArchive" ]] || [[ ! -f "$incSnapshot" ]] && continue
-
-				local incArchiveDate=`date -r "$incArchive"`
-				local incArchiveSize=`stat -c '%s' "$incArchive"`
-				incArchiveSize=`numfmt --to=iec-i --suffix=B --format="%3f" $incArchiveSize`
-
-				backups+=("$incArchive")
-				((backupIndex++))
-				[ "$output" = true ] && echo "  $backupIndex. Incremental backup (day $day) on $incArchiveDate ($incArchiveSize)"
-			done
-			
-		done
-	done
-	
-	# Reset dealing with empty directories
-	shopt -u nullglob
+	readDirectory "$BACKUP_DESTINATION" "$depth"
 }
 
 function chooseBackup {
@@ -428,7 +517,7 @@ function chooseBackup {
 	fi
 	((backupIndex--))
 	
-	echo
+	[ "$VERBOSE" = true ] && echo
 	
 	[[ "$backupIndex" -lt 0 ]] || [[ "$backupIndex" -gt "(${#backups[@]}-1)" ]] && exit 200 
 
@@ -488,86 +577,190 @@ function chooseBackup {
 # Restore a specific backup
 function restore {
 
-	
-	chooseBackup "Which backup to restore?"
-	
-	echo -n "Continue? (y/N): "
-	
-	read confirm
-	
-	if [[ ! "$confirm" == "y" ]]; then
-		exit 200
-	fi
-	
-	echo
-	
-	echo "Restoring backup ..."
+	[ "$VERBOSE" = true ] && echo && echo "Restoration requested." && echo
 
-	echo
-	cat "$selectedArchive" | tar xvzf - -g /dev/null --ignore-zeros -C "$src"
-	res="$?"
+	# Check directories
+	checkBackupSource
+	checkBackupDestination
+	checkBackupParent
+
+	readBackup "$BACKUP_PARENT"
+	
+	if [ "${backupInfo[0]}" = false ]; then
+		fail "${backupInfo[1]}" 190
+	fi
+	
+	local archive="${backupInfo[1]}"
+	local snapshot="${backupInfo[2]}"
+	local level="${backupInfo[3]}"
+			
+	if [ "$VERBOSE" = true ]; then
+		echo "Archive file            : `basename "$archive"`"
+		echo "Snapshot file           : `basename "$snapshot"`"
+		echo "Level                   : $level"
+		echo
+	fi	
+	
+	[ "$VERBOSE" = true ] && echo "Building incremental backup chain ..."
+	
+	local backupChain=($archive)
+	local currentDirectory=`dirname "$archive"`
+	 
+	local currentLevel="$level"
+	while [ "$currentLevel" -gt 0 ]; do
+		currentDirectory=`dirname "$currentDirectory"`
+		readBackup "$currentDirectory"
+		if [ "${backupInfo[0]}" = false ]; then
+			fail "${backupInfo[1]}" 190
+		fi
+		
+		backupChain+=(${backupInfo[1]})
+		((currentLevel--))
+	done
+	
+	[ "$VERBOSE" = true ] && printf '%s\n' "${backupChain[@]}"
+	
+	if [ ! "$BATCH_MODE" = true ]; then
+		print_warn "Really restore? (y/N): "
+		
+		read confirm
+		
+		if [[ ! "$confirm" == "y" ]]; then
+			exit 200
+		fi
+		echo
+	fi
+	
+	
+	echo "Restoring backup ... "
 	echo
 	
-	if [[ "$res" -eq 0 ]]; then
-		print_ok "Success"
-		echo
-	else
-		fail "There were errors!" $res
-	fi
+	local chainLastIndex=$((${#backupChain[@]}-1))
+	
+	for ((chainIndex=$chainLastIndex; chainIndex >= 0; chainIndex--)); do
+		local backupArchive="${backupChain[$chainIndex]}"
+		local backupDir=`dirname "$backupArchive"`
+		local backupName=`basename "$backupDir"`
+		
+		local tarOps="-x"
+		[ "$VERBOSE" = true ] && tarOps="${tarOps}v"
+		
+		if [ "$BACKUP_COMPRESSION" == "gzip" ]; then
+			tarOps="${tarOps}z"
+		elif [ "$BACKUP_COMPRESSION" == "bzip2" ]; then
+			tarOps="${tarOps}j"
+		else
+			fail "Unknown compression! ($BACKUP_COMPRESSION)" 150
+		fi	
+		
+		tarOps="${tarOps}f"
+		
+		[ "$VERBOSE" = true ] && echo "[$backupName] ... "
+		
+		tar $tarOps "$backupArchive" -C "$BACKUP_SOURCE"		
+		
+		res=$?
+		
+		if [[ "$res" -eq 0 ]]; then
+			[ "$VERBOSE" = true ] && print_ok "Success" true
+		else	
+			print_err "error $res" true
+			fail "Could not restore backup!" 220
+		fi
+								
+	done
+		
+
+	#cat "$selectedArchive" | tar xvzf - -g /dev/null --ignore-zeros -C "$src"
+	
 }
 
 ### remove
 # Removes a specific backup
 function remove {
+	
+	checkBackupParent
 
-	chooseBackup "Which backup to remove?"
-	
-	echo -n "Continue? (y/N): "
-	
-	read confirm
-	
-	if [[ ! "$confirm" == "y" ]]; then
-		exit 200
+	if [ ! "$BATCH_MODE" = true ]; then
+		print_warn "Really remove? (y/N): "
+		
+		read confirm
+		
+		if [[ ! "$confirm" == "y" ]]; then
+			exit 200
+		fi
+		echo
 	fi
+
+	echo -n "Removing backup ... "
 	
-	echo
-	echo "Removing backup ..."
-	echo
-	
-	local archiveDir=`dirname "$selectedArchive"`
+	local archiveDir="$BACKUP_PARENT"
 	
 	rm -r "$archiveDir"
 	
 	res="$?"
-	echo
 	
 	if [[ "$res" -eq 0 ]]; then
-		print_ok "Success"
-		echo
+		print_ok "success" true
 	else
-		fail "There were errors!" $res
+		print_err "error $res" true
+		fail "Could not delete backup!" 210
 	fi
 }
 
-### remove
-# Removes a specific backup
+### show
+# Shows metadata and contained files of a specific backup
 function show {
-
 	chooseBackup "Which backup to show?"
 
+	echo "Folders and files:"
 	tar tzf "$selectedArchive"	
 }
 
 
+
 VERBOSE=false
+BATCH_MODE=false
 CONFIG_FILE="incback.conf"
 
-while getopts ":vc:" opt; do
+BACKUP_SOURCE="/home/falk/bin/incback/source.test"
+BACKUP_DESTINATION="/home/falk/bin/incback/destination.test"
+BACKUP_COMPRESSION="gzip"
+BACKUP_PARENT=""
+
+# We want empty results if no dirs/files can be found while globbing
+shopt -s nullglob
+trap "{ shopt -u nullglob; }" EXIT
+
+# Look for configuration option to load that first
+while getopts ":f:vb" opt; do
   case $opt in
+	b)
+	  BATCH_MODE=true;;
     v)
       VERBOSE=true;;
-    c)
+    f)
       CONFIG_FILE="$OPTARG";;
+    *)
+      ;;
+  esac
+done
+
+# Load configuration if available
+loadConfiguration
+
+# Parse rest of options, overwriting configuration file settings
+OPTIND=1
+while getopts ":vbc:s:d:p:f:" opt; do
+  case $opt in
+    c)
+      BACKUP_COMPRESSION="$OPTARG";;
+    s)
+      BACKUP_SOURCE+=("$OPTARG");;
+    d)
+      BACKUP_DESTINATION="$OPTARG";;
+    p)
+      BACKUP_PARENT="$OPTARG";;
     \?)
       fail "Invalid option: -$OPTARG" 1 true;;
     :)
@@ -575,13 +768,16 @@ while getopts ":vc:" opt; do
   esac
 done
 
+# Skip over options
 shift $(($OPTIND-1))
 
+# Action and action-argument after options
 SCRIPT_ACTION="$1"
 SCRIPT_ACTION_ARG="$2"
+
 case "$SCRIPT_ACTION" in
 	backup)
-		backup;;
+		backup "$SCRIPT_ACTION_ARG";;
 	list)
 		list;;
 	restore)
